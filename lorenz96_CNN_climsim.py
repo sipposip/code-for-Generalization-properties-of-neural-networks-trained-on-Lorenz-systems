@@ -1,6 +1,7 @@
 """
-this script trains a CNN on lorenz95 and then evaluates the NN forecasts
 
+this script trains a CNN on lorenz95 and then makes a climate simulation with the network
+and plots some aspects of the climate
 """
 
 
@@ -23,7 +24,7 @@ from keras import backend as K
 # session = tf.Session(config=config)
 # K.set_session(session)
 
-
+plt.rcParams['savefig.bbox'] = 'tight'
 # paramters for experiments
 N = 40  # number of variables
 F = 8
@@ -33,6 +34,8 @@ t_arr = np.arange(0, Nsteps) * tstep
 
 # fixed params neural network
 n_epoch = 30
+
+lead_time=10
 
 
 def lorenz96(x,t):
@@ -168,7 +171,7 @@ def train_network(X_train, y_train, lr,kernel_size, conv_depth, n_conv, activati
     model.compile(optimizer=optimizer, loss='mean_squared_error')
 
     print(model.summary())
-    hist = model.fit(X_train, y_train, epochs=n_epoch, verbose=0, validation_split=0.1 ,
+    hist = model.fit(X_train, y_train, epochs=n_epoch, verbose=2, validation_split=0.1 ,
                      callbacks=[keras.callbacks.EarlyStopping(monitor='val_loss',
                                                               min_delta=0,
                                                               patience=4,
@@ -184,91 +187,73 @@ params = {100:{"activation": "sigmoid", "conv_depth": 32, "kernel_size": 5, "lr"
           10:{"activation": "relu", "conv_depth": 128, "kernel_size": 5, "lr": 0.003, "n_conv": 2},
           1:{"activation": "relu", "conv_depth": 128, "kernel_size": 3, "lr": 0.003, "n_conv": 1}}
 
-res_all = []
-for lead_time in [1,10,100]:
-    print(f'lead_time {lead_time}')
-    X_train = modelrun_train[:-lead_time]
-    y_train = modelrun_train[lead_time:]
-
-    network, hist =  train_network(X_train, y_train, **params[lead_time])
-
-    preds=modelrun_test
-    #  we have to add an empty channel dimension
-    preds = preds[..., np.newaxis]
-    errors = []
-    accs = []
-    tsteps = []
-    for i in range(1,int(1000//lead_time)+1):
-        print(i)
-        preds = network.predict(preds)
-        truth = modelrun_test[i*lead_time:]
-        preds_cut = np.squeeze(preds[:-i*lead_time])
-        assert(preds_cut.shape==truth.shape)
-        rmse = np.sqrt(np.mean( (preds_cut-truth)**2))
-        errors.append(rmse)
-        tsteps.append(i*lead_time)
-
-        acc = np.mean([np.corrcoef(truth[i],preds_cut[i])[0,1] for i in range(len(preds_cut))])
-        accs.append(acc)
-    res_all.append(pd.DataFrame({'lead_time_training':lead_time,'lead_time':tsteps,'rmse':errors,
-                                 'acc':accs}))
-
-
-res_df = pd.concat(res_all)
-res_df.to_pickle('lorenz95CNN_rmse_vs_timesteps.pkl')
-
-# normalize lead_time by timestep
-res_df['lead_time'] *= tstep
-res_df['lead_time_training'] *= tstep
-#%%
-plt.rcParams['savefig.bbox'] = 'tight'
-plt.figure(figsize=(6.4,4))
-sns.set_palette('colorblind')
-sns.set_context('notebook',font_scale=1.5)
-sns.set_style('ticks')
-sns.lineplot('lead_time', 'rmse', hue='lead_time_training', data=res_df, legend='full', marker='o',
-             dashes=False, markeredgecolor='none',
-             palette=sns.color_palette('coolwarm', n_colors=len(np.unique(res_df['lead_time_training']))))
-plt.legend()
-sns.despine()
-plt.savefig('lorenz95CNN_rmse_vs_timesteps.pdf')
-
-plt.figure(figsize=(6.4,4))
-sns.set_palette('colorblind')
-sns.lineplot('lead_time', 'acc', hue='lead_time_training', data=res_df, legend='full', marker='o',
-             dashes=False, markeredgecolor='none',
-             palette=sns.color_palette('coolwarm', n_colors=len(np.unique(res_df['lead_time_training']))))
-plt.legend()
-sns.despine()
-plt.savefig('lorenz95CNN_acc_vs_timesteps.pdf')
-
-# detailed analysis for leadtime 10
-lead_time = 10
 X_train = modelrun_train[:-lead_time]
 y_train = modelrun_train[lead_time:]
-X_test = modelrun_test[:-lead_time]
-y_test = modelrun_test[lead_time:]
 
-tendencies = np.mean(np.abs(X_train[1:] - X_train[:-1]), axis=1)
+network, hist =  train_network(X_train, y_train, **params[lead_time])
 
-network, hist = train_network(X_train, y_train, **params[lead_time])
+# make climate simulation, starting from first field of the test run
 
-preds_test = network.predict(X_test[:,:,np.newaxis]).squeeze()
-preds_train = network.predict(X_train[:,:,np.newaxis]).squeeze()
-abse_test = np.mean(np.abs(preds_test - y_test), axis=1)
-abse_train = np.mean(np.abs(preds_train - y_train), axis=1)
+y_init = modelrun_test[0]
+N_clim = int(Nsteps // lead_time)
+current_state = y_init[np.newaxis,:,np.newaxis]
+res = [np.squeeze(current_state)]
+for i in range(N_clim):
+    current_state = network.predict(current_state)
+    res.append(np.squeeze(current_state))
 
-sns.set_context('notebook', font_scale=1.2)
+
+res = np.array(res)
+
+nplot = 100
 plt.figure()
-sns.kdeplot(abse_train, label='train data')
-sns.kdeplot(abse_test, label='test data')
-sns.kdeplot(tendencies, label='mean absolute tendency', linestyle='--')
-plt.legend()
+clevs = [-3,-2.5,-2,-1.5,-1,-0.5,0.5, 1, 1.5, 2, 2.5, 3]
+plt.subplot(121)
+plt.contourf(modelrun_test[::lead_time][:nplot], cmap=plt.cm.RdBu, levels=clevs)
+plt.title('model')
+plt.xlabel('gridpoint')
+plt.ylabel('timestep [0.1 timeunits]')
+plt.colorbar()
+plt.subplot(122)
+plt.contourf(res[:nplot], cmap=plt.cm.RdBu, levels=clevs)
+plt.title('network climate')
+plt.xlabel('gridpoint')
+plt.colorbar()
+plt.savefig('lorenz95_CNN_clim_evaluation_waveplot.pdf')
+
+
+
+plt.figure(figsize=(10,6))
+plt.subplot(211)
+plt.boxplot(modelrun_test[::lead_time])
+plt.title('model')
+plt.subplot(212)
+plt.boxplot(res)
+plt.title('network climate')
+plt.xlabel('gridpoint')
+plt.savefig('lorenz95_CNN_clim_evaluation_boxplot.pdf')
+
+# plot one single gridpoint
+i = 5
+plt.figure(figsize=(10,4))
+plt.plot(res[:,i], label='network')
+plt.plot(modelrun_test[::lead_time,i], label='model')
 sns.despine()
-plt.ylabel('density')
-plt.xlabel('MAE lead time 0.1')
-plt.savefig('lorenz95_eval_train_vs_test.pdf')
+plt.legend()
+plt.xlabel('timestep')
+plt.ylabel('single gridpoint')
+plt.savefig('lorenz95_CNN_clim_evaluation_single_gridpoint.pdf')
 
 
+plt.figure(figsize=(10,6))
+plt.subplot(211)
+plt.acorr(modelrun_test[::lead_time,i])
+plt.title('model')
+plt.subplot(212)
+plt.acorr(res[:,i])
+plt.title('network climate')
+plt.xlabel('timelag in timesteps')
+plt.ylabel('autocorrelation')
+plt.savefig('lorenz95_CNN_clim_evaluation_acorr.pdf')
 
 

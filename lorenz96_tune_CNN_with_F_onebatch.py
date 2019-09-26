@@ -1,27 +1,24 @@
 """
-this script trains a CNN on lorenz95 and then evaluates the NN forecasts
+
 
 """
 
 
 
 import pickle
+import sys
 
-import pandas as pd
 import numpy as np
-from pylab import plt
-import seaborn as sns
 from scipy.integrate import odeint
 from sklearn.model_selection import ParameterGrid
 import keras
 import tensorflow as tf
 from keras import backend as K
 
-# # set maximum numpber of CPUs to use
-# config = tf.ConfigProto(intra_op_parallelism_threads=32, inter_op_parallelism_threads=32,
-#                         allow_soft_placement=True)
-# session = tf.Session(config=config)
-# K.set_session(session)
+
+
+i_batch = int(sys.argv[1])
+n_batch = int(sys.argv[2])
 
 
 # paramters for experiments
@@ -35,7 +32,7 @@ t_arr = np.arange(0, Nsteps) * tstep
 n_epoch = 30
 
 
-def lorenz96(x,t):
+def lorenz96(x,t,F):
 
   # compute state derivatives
   d = np.zeros(N)
@@ -52,23 +49,37 @@ def lorenz96(x,t):
 
   return d
 
+
+def make_lorenz_run(y0, Nsteps  , F_arr):
+    res = np.zeros((Nsteps,N))
+    res[0] = y0
+    sol = y0
+    for i in range(Nsteps-1):  #-1 because we also include the initial state in Nsteps
+        F = F_arr[i]
+        # print(i)
+        # we make only one step, but we gert a 2d array back. 9with only one element)
+        # therefore, we extract this element with [1]
+        sol = odeint(lorenz96, sol, t=[0,tstep], args=(F,))[1]
+        res[i] = sol
+    return res
+
 # we make two runs, started with slightly different initial conditions
 # one will be the training and one the test run
 x_init1 = F*np.ones(N) # initial state (equilibrium)
 x_init1[19] += 0.01 # add small perturbation to 20th variable
 
-modelrun_train = odeint(lorenz96,y0=x_init1, t= t_arr)
+F_start = 6
+F_end = 7
 
-x_init2 = F*np.ones(N)
-x_init2[1] += 0.05 #
+F_arr = F_start * np.ones(len(t_arr)) + (F_end - F_start) / Nsteps / tstep * t_arr
 
-modelrun_test = odeint(lorenz96,y0=x_init2, t= t_arr)
+modelrun_train = make_lorenz_run(x_init1, Nsteps, F_arr)
+
+
 
 # remove spinpu
 modelrun_train = modelrun_train[500:]
-modelrun_test = modelrun_test[500:]
-
-
+F_arr = F_arr[500:]
 
 # for loezn96, we dont have to normalize per variable, because all should have the same
 # st and mean anywary, so we compute the total mean,  and the std for each gridpoint and then
@@ -77,7 +88,12 @@ norm_mean = modelrun_train.mean()
 norm_std = modelrun_train.std(axis=0).mean()
 modelrun_train = (modelrun_train  - norm_mean) / norm_std
 
-modelrun_test = (modelrun_test - norm_mean) / norm_std
+
+F_arr_normed = (F_arr - F_arr.mean()) / F_arr.std()
+
+
+# now add F as a second layer (repeating it for every gridpoint)
+modelrun_train_with_F = np.stack([modelrun_train ,np.tile(F_arr_normed, (N,1)).T], axis=2)
 
 class PeriodicPadding(keras.layers.Layer):
     def __init__(self, axis, padding, **kwargs):
@@ -143,7 +159,7 @@ def train_network(X_train, y_train, lr,kernel_size, conv_depth, n_conv, activati
     :return:
     """
 
-    n_channel = 1 # empty
+    n_channel = 2
     n_pad = int(np.floor(kernel_size/2))
     layers = [
         PeriodicPadding(axis=1,padding=n_pad,input_shape=(N ,n_channel)),
@@ -161,9 +177,8 @@ def train_network(X_train, y_train, lr,kernel_size, conv_depth, n_conv, activati
 
     model = keras.Sequential(layers)
 
-    #  we have to add an empty channel dimension
+    #  we have to add an empty channel dimension for y_train
     y_train = y_train[..., np.newaxis]
-    X_train = X_train[..., np.newaxis]
     optimizer = keras.optimizers.adam(lr=lr)
     model.compile(optimizer=optimizer, loss='mean_squared_error')
 
@@ -180,95 +195,32 @@ def train_network(X_train, y_train, lr,kernel_size, conv_depth, n_conv, activati
     return model, hist
 
 
-params = {100:{"activation": "sigmoid", "conv_depth": 32, "kernel_size": 5, "lr": 0.003, "n_conv": 9},
-          10:{"activation": "relu", "conv_depth": 128, "kernel_size": 5, "lr": 0.003, "n_conv": 2},
-          1:{"activation": "relu", "conv_depth": 128, "kernel_size": 3, "lr": 0.003, "n_conv": 1}}
+tunable_params = dict(
+                  lr=[0.00001,0.00003,0.0001,0.003],
+                  kernel_size = [3,5,7,9],
+                  conv_depth = [32,64,128],
+                  n_conv=list(range(1,10)),
+            activation=['sigmoid', 'relu']
+        )
 
-res_all = []
+
+param_grid = list(ParameterGrid(tunable_params))
+n_combis = len(param_grid)
+combis_per_batch = int(np.ceil(n_combis / n_batch))
+
+
+print(f'trying {len(param_grid)} param combinations')
+
+
 for lead_time in [1,10,100]:
     print(f'lead_time {lead_time}')
-    X_train = modelrun_train[:-lead_time]
+    X_train = modelrun_train_with_F[:-lead_time]
     y_train = modelrun_train[lead_time:]
 
-    network, hist =  train_network(X_train, y_train, **params[lead_time])
-
-    preds=modelrun_test
-    #  we have to add an empty channel dimension
-    preds = preds[..., np.newaxis]
-    errors = []
-    accs = []
-    tsteps = []
-    for i in range(1,int(1000//lead_time)+1):
-        print(i)
-        preds = network.predict(preds)
-        truth = modelrun_test[i*lead_time:]
-        preds_cut = np.squeeze(preds[:-i*lead_time])
-        assert(preds_cut.shape==truth.shape)
-        rmse = np.sqrt(np.mean( (preds_cut-truth)**2))
-        errors.append(rmse)
-        tsteps.append(i*lead_time)
-
-        acc = np.mean([np.corrcoef(truth[i],preds_cut[i])[0,1] for i in range(len(preds_cut))])
-        accs.append(acc)
-    res_all.append(pd.DataFrame({'lead_time_training':lead_time,'lead_time':tsteps,'rmse':errors,
-                                 'acc':accs}))
-
-
-res_df = pd.concat(res_all)
-res_df.to_pickle('lorenz95CNN_rmse_vs_timesteps.pkl')
-
-# normalize lead_time by timestep
-res_df['lead_time'] *= tstep
-res_df['lead_time_training'] *= tstep
-#%%
-plt.rcParams['savefig.bbox'] = 'tight'
-plt.figure(figsize=(6.4,4))
-sns.set_palette('colorblind')
-sns.set_context('notebook',font_scale=1.5)
-sns.set_style('ticks')
-sns.lineplot('lead_time', 'rmse', hue='lead_time_training', data=res_df, legend='full', marker='o',
-             dashes=False, markeredgecolor='none',
-             palette=sns.color_palette('coolwarm', n_colors=len(np.unique(res_df['lead_time_training']))))
-plt.legend()
-sns.despine()
-plt.savefig('lorenz95CNN_rmse_vs_timesteps.pdf')
-
-plt.figure(figsize=(6.4,4))
-sns.set_palette('colorblind')
-sns.lineplot('lead_time', 'acc', hue='lead_time_training', data=res_df, legend='full', marker='o',
-             dashes=False, markeredgecolor='none',
-             palette=sns.color_palette('coolwarm', n_colors=len(np.unique(res_df['lead_time_training']))))
-plt.legend()
-sns.despine()
-plt.savefig('lorenz95CNN_acc_vs_timesteps.pdf')
-
-# detailed analysis for leadtime 10
-lead_time = 10
-X_train = modelrun_train[:-lead_time]
-y_train = modelrun_train[lead_time:]
-X_test = modelrun_test[:-lead_time]
-y_test = modelrun_test[lead_time:]
-
-tendencies = np.mean(np.abs(X_train[1:] - X_train[:-1]), axis=1)
-
-network, hist = train_network(X_train, y_train, **params[lead_time])
-
-preds_test = network.predict(X_test[:,:,np.newaxis]).squeeze()
-preds_train = network.predict(X_train[:,:,np.newaxis]).squeeze()
-abse_test = np.mean(np.abs(preds_test - y_test), axis=1)
-abse_train = np.mean(np.abs(preds_train - y_train), axis=1)
-
-sns.set_context('notebook', font_scale=1.2)
-plt.figure()
-sns.kdeplot(abse_train, label='train data')
-sns.kdeplot(abse_test, label='test data')
-sns.kdeplot(tendencies, label='mean absolute tendency', linestyle='--')
-plt.legend()
-sns.despine()
-plt.ylabel('density')
-plt.xlabel('MAE lead time 0.1')
-plt.savefig('lorenz95_eval_train_vs_test.pdf')
-
-
-
-
+    res = []
+    for i,params in enumerate(param_grid):
+        if i in range(combis_per_batch * i_batch, combis_per_batch * (i_batch+1)):
+            print(f'param combi {i} out of {len(param_grid)}')
+            network, hist =  train_network(X_train, y_train, **params)
+            res.append({'hist':hist.history, 'params':params})
+            pickle.dump({'hist':hist.history, 'params':params},open(f'tunehist_F_leadtime{lead_time}_paramcombi_{i}_.pkl','wb'))
